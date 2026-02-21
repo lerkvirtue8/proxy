@@ -3,26 +3,46 @@
 //  ENV: GEMINI_API_KEY
 // ============================================
 
-const { MASTER_PROMPT } = require('../prompts');
+const path = require('path');
+
+// Defensive prompt import — if this fails, function still serves CORS + error
+let MASTER_PROMPT = 'You are Barrix AI, an expert coding assistant. The user is working in an IDE. Always respond with code in fenced markdown blocks using // filename: directives.';
+try {
+  MASTER_PROMPT = require(path.join(__dirname, '..', 'prompts')).MASTER_PROMPT || MASTER_PROMPT;
+} catch (e) {
+  console.error('[gemini] Failed to load prompts.js:', e.message);
+}
 
 const GEMINI_BASE = 'https://generativelanguage.googleapis.com/v1beta';
 
-module.exports = async function handler(req, res) {
-  // ---- CORS ----
+// Shared CORS helper — always sets headers before anything else
+function setCors(res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+}
+
+module.exports = async function handler(req, res) {
+  // CORS first — before ANY logic that could throw
+  setCors(res);
   if (req.method === 'OPTIONS') return res.status(200).end();
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) return res.status(500).json({ error: 'GEMINI_API_KEY not configured' });
 
-  const { model, message, stream } = req.body || {};
+  let body;
+  try {
+    body = typeof req.body === 'string' ? JSON.parse(req.body) : (req.body || {});
+  } catch (e) {
+    return res.status(400).json({ error: 'Invalid JSON body' });
+  }
+
+  const { model, message, stream } = body;
   if (!model || !message) return res.status(400).json({ error: 'Missing model or message' });
 
   // Build Google Generative Language API body
-  const body = {
+  const geminiBody = {
     contents: [{ role: 'user', parts: [{ text: message }] }],
     systemInstruction: { parts: [{ text: MASTER_PROMPT }] },
     generationConfig: {
@@ -38,7 +58,7 @@ module.exports = async function handler(req, res) {
       const upstream = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body)
+        body: JSON.stringify(geminiBody)
       });
 
       if (!upstream.ok) {
@@ -97,7 +117,7 @@ module.exports = async function handler(req, res) {
       const upstream = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body)
+        body: JSON.stringify(geminiBody)
       });
 
       if (!upstream.ok) {
@@ -106,12 +126,12 @@ module.exports = async function handler(req, res) {
       }
 
       const data = await upstream.json();
-      // Return in the format the client expects
       const text = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
       return res.json({ text, candidates: data.candidates });
     }
   } catch (e) {
     console.error('Gemini proxy error:', e);
+    // CORS already set at top, so this error response will be readable
     return res.status(500).json({ error: e.message || 'Internal proxy error' });
   }
 };
