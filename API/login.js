@@ -3,17 +3,28 @@
 //  ENV: WP_BACKEND_URL  (e.g. https://dirtmercy.com)
 // ============================================
 
-module.exports = async function handler(req, res) {
+function setCors(res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+}
+
+module.exports = async function handler(req, res) {
+  setCors(res);
   if (req.method === 'OPTIONS') return res.status(200).end();
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
   var wpUrl = process.env.WP_BACKEND_URL;
   if (!wpUrl) return res.status(500).json({ error: 'WP_BACKEND_URL not configured' });
 
-  var { username, password } = req.body || {};
+  let body;
+  try {
+    body = typeof req.body === 'string' ? JSON.parse(req.body) : (req.body || {});
+  } catch (e) {
+    return res.status(400).json({ error: 'Invalid JSON body' });
+  }
+
+  var { username, password } = body;
   if (!username || !password) return res.status(400).json({ error: 'Missing credentials' });
 
   try {
