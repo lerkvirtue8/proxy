@@ -13,18 +13,30 @@
 
 const POE_API_BASE = 'https://api.poe.com/bot';
 
-module.exports = async function handler(req, res) {
-  // ---- CORS ----
+// CORS helper — always called first
+function setCors(res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+}
+
+module.exports = async function handler(req, res) {
+  // CORS first — before ANY logic that could throw
+  setCors(res);
   if (req.method === 'OPTIONS') return res.status(200).end();
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
   const apiKey = process.env.POE_API_KEY;
   if (!apiKey) return res.status(500).json({ error: 'POE_API_KEY not configured' });
 
-  const { botName, message, stream, conversationId, parameters } = req.body || {};
+  let body;
+  try {
+    body = typeof req.body === 'string' ? JSON.parse(req.body) : (req.body || {});
+  } catch (e) {
+    return res.status(400).json({ error: 'Invalid JSON body' });
+  }
+
+  const { botName, message, stream, conversationId, parameters } = body;
   if (!botName || !message) return res.status(400).json({ error: 'Missing botName or message' });
 
   // Build Poe protocol query
