@@ -1,19 +1,20 @@
 // =============================================
-//  Poe Adapter v2 — Browser-side mock of window.Poe
+//  Poe Adapter v3 — Browser-side mock of window.Poe
 //
-//  When the app runs OUTSIDE Poe's native iframe
-//  (e.g. in a browser via the proxy), this script
-//  provides window.Poe.sendUserMessage() and
+//  Provides window.Poe.sendUserMessage() and
 //  window.Poe.registerHandler() that route through
-//  the proxy server and relay streamed responses.
+//  the Vercel proxy. Content is CUMULATIVE in
+//  handler calls, matching native Poe API spec.
 //
-//  KEY FIX: content is always CUMULATIVE in handler
-//  calls, matching the native Poe API spec.
+//  v3 changes:
+//  - Sends 'complete' to handler even if stream was empty
+//  - Sends 'error' if fetch fails or stream has no events
+//  - Health check: window.Poe._checkHealth()
 // =============================================
 (function () {
   'use strict';
 
-  // Skip if native Poe API is already present
+  // Skip if native Poe API is already present (running inside Poe iframe)
   if (window.Poe && typeof window.Poe.sendUserMessage === 'function') return;
 
   var config = window.POE_ADAPTER_CONFIG || {};
@@ -52,7 +53,7 @@
         if (!raw) continue;
         try {
           onEvent(JSON.parse(raw));
-        } catch (_) { /* skip */ }
+        } catch (_) { /* skip malformed JSON */ }
       }
     }
   }
@@ -62,7 +63,6 @@
     options = options || {};
     var handlerName = options.handler || null;
     var shouldStream = options.stream !== false;
-    var openChat = options.openChat !== false;
     var handlerContext = options.handlerContext || {};
     var parameters = options.parameters || {};
 
@@ -83,6 +83,7 @@
       parameters: parameters
     };
 
+    // ---- Make the fetch request ----
     var response;
     try {
       response = await fetch(proxyUrl, {
@@ -91,13 +92,37 @@
         body: JSON.stringify(body)
       });
     } catch (e) {
-      throw { message: 'Network error: ' + (e.message || 'Failed to fetch'), errorType: 'UNKNOWN' };
+      var fetchErr = { message: 'Network error: ' + (e.message || 'Failed to fetch'), errorType: 'UNKNOWN' };
+      // Also notify handler of the error so the UI can update
+      if (handlerName && handlers[handlerName]) {
+        handlers[handlerName]({
+          status: 'error',
+          responses: [{
+            messageId: '', senderId: botName, content: '',
+            contentType: 'text/markdown', status: 'error',
+            statusText: fetchErr.message
+          }]
+        }, handlerContext);
+      }
+      throw fetchErr;
     }
 
     if (!response.ok) {
       var errText = '';
       try { errText = await response.text(); } catch (_) { /* noop */ }
-      throw { message: 'Proxy error ' + response.status + ': ' + errText, errorType: 'UNKNOWN' };
+      var proxyErr = { message: 'Proxy error ' + response.status + ': ' + errText, errorType: 'UNKNOWN' };
+      // Notify handler
+      if (handlerName && handlers[handlerName]) {
+        handlers[handlerName]({
+          status: 'error',
+          responses: [{
+            messageId: '', senderId: botName, content: '',
+            contentType: 'text/markdown', status: 'error',
+            statusText: proxyErr.message
+          }]
+        }, handlerContext);
+      }
+      throw proxyErr;
     }
 
     // ---- Parse SSE stream and dispatch to handler ----
@@ -106,7 +131,9 @@
       var reader = response.body.getReader();
       var decoder = new TextDecoder();
       var sseBuffer = '';
-      var lastStatus = 'incomplete';
+      var eventCount = 0;
+      var gotComplete = false;
+      var lastContent = '';
 
       // Read SSE chunks
       while (true) {
@@ -114,15 +141,11 @@
         try {
           result = await reader.read();
         } catch (readErr) {
-          // Stream read error — send error event to handler
           handler({
             status: 'error',
             responses: [{
-              messageId: '',
-              senderId: botName,
-              content: '',
-              contentType: 'text/markdown',
-              status: 'error',
+              messageId: '', senderId: botName, content: lastContent,
+              contentType: 'text/markdown', status: 'error',
               statusText: 'Stream read error: ' + (readErr.message || 'Unknown')
             }]
           }, handlerContext);
@@ -132,13 +155,14 @@
         if (result.done) break;
         sseBuffer += decoder.decode(result.value, { stream: true });
 
-        // Split on double-newline (SSE event boundary) or single newline for data lines
+        // Split on double-newline (SSE event boundary)
         var eventChunks = sseBuffer.split('\n\n');
         sseBuffer = eventChunks.pop() || '';
 
         for (var ci = 0; ci < eventChunks.length; ci++) {
           parseSSE(eventChunks[ci], function (evt) {
-            log('SSE event:', evt.status, '| content length:', (evt.content || '').length);
+            eventCount++;
+            log('SSE event #' + eventCount + ':', evt.status, '| content length:', (evt.content || '').length);
 
             var msg = {
               messageId: evt.messageId || '',
@@ -150,7 +174,8 @@
               attachments: evt.attachments || undefined
             };
 
-            lastStatus = evt.status || lastStatus;
+            if (evt.content) lastContent = evt.content;
+            if (evt.status === 'complete') gotComplete = true;
 
             handler({
               status: evt.status || 'incomplete',
@@ -160,9 +185,10 @@
         }
       }
 
-      // If stream ended but we never got a "complete" event, flush remaining buffer and send complete
+      // Flush remaining SSE buffer
       if (sseBuffer.trim()) {
         parseSSE(sseBuffer, function (evt) {
+          eventCount++;
           var msg = {
             messageId: evt.messageId || '',
             senderId: evt.senderId || botName,
@@ -172,15 +198,42 @@
             statusText: evt.statusText || undefined,
             attachments: evt.attachments || undefined
           };
+          if (evt.content) lastContent = evt.content;
+          if (evt.status === 'complete' || !evt.status) gotComplete = true;
           handler({
             status: evt.status || 'complete',
             responses: [msg]
           }, handlerContext);
-          lastStatus = evt.status || 'complete';
         });
       }
 
-      log('Stream finished, lastStatus:', lastStatus);
+      // CRITICAL: If stream ended but handler never got a 'complete' event,
+      // send one now so the caller's Promise resolves
+      if (!gotComplete) {
+        log('Stream ended without complete event. eventCount=' + eventCount + ', sending synthetic complete.');
+        if (eventCount === 0) {
+          // No events at all — proxy returned empty/broken response
+          handler({
+            status: 'error',
+            responses: [{
+              messageId: '', senderId: botName, content: '',
+              contentType: 'text/markdown', status: 'error',
+              statusText: 'Proxy returned empty response — check deployment and environment variables at /api/health'
+            }]
+          }, handlerContext);
+        } else {
+          // Had some events but no explicit complete — send complete with last known content
+          handler({
+            status: 'complete',
+            responses: [{
+              messageId: '', senderId: botName, content: lastContent,
+              contentType: 'text/markdown', status: 'complete'
+            }]
+          }, handlerContext);
+        }
+      }
+
+      log('Stream finished. Events:', eventCount, '| gotComplete:', gotComplete);
     }
 
     return { success: true };
@@ -189,12 +242,8 @@
   // ---- getTriggerMessage stub ----
   async function getTriggerMessage() {
     return {
-      messageId: '',
-      senderId: '',
-      content: '',
-      contentType: 'text/plain',
-      status: 'complete',
-      attachments: []
+      messageId: '', senderId: '', content: '',
+      contentType: 'text/plain', status: 'complete', attachments: []
     };
   }
 
@@ -209,13 +258,34 @@
     return { success: true };
   }
 
+  // ---- Health check ----
+  async function checkHealth() {
+    var base = proxyUrl.replace(/\/api\/poe-proxy\/?$/, '');
+    var url = base + '/api/health';
+    try {
+      var res = await fetch(url);
+      var data = await res.json();
+      console.log('[PoeAdapter] Health check:', JSON.stringify(data));
+      return data;
+    } catch (e) {
+      console.error('[PoeAdapter] Health check FAILED:', e.message);
+      return { status: 'unreachable', error: e.message };
+    }
+  }
+
   // ---- Expose API ----
   window.Poe = {
     sendUserMessage: sendUserMessage,
     registerHandler: registerHandler,
     getTriggerMessage: getTriggerMessage,
-    captureCost: captureCost
+    captureCost: captureCost,
+    _checkHealth: checkHealth
   };
 
-  log('Poe Adapter v2 initialized | proxy:', proxyUrl);
+  log('Poe Adapter v3 initialized | proxy:', proxyUrl);
+
+  // Auto health check on load (non-blocking)
+  if (debug) {
+    setTimeout(function() { checkHealth(); }, 1000);
+  }
 })();
