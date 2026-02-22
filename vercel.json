@@ -17,17 +17,5 @@
         { "key": "Cache-Control", "value": "public, max-age=300" }
       ]
     }
-  ],
-  "functions": {
-    "api/gemini.js": {
-      "maxDuration": 120,
-      "includeFiles": "prompts.js"
-    },
-    "api/poe-proxy.js": {
-      "maxDuration": 120
-    },
-    "api/prompts.js": {
-      "includeFiles": "prompts.js"
-    }
-  }
+  ]
 }
